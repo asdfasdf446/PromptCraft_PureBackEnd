@@ -41,7 +41,7 @@ func (s *Server) HandleConnections(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	// Send initial state
-	s.broadcastState()
+	s.BroadcastState()
 
 	for {
 		_, msg, err := conn.ReadMessage()
@@ -59,12 +59,12 @@ func (s *Server) HandleConnections(w http.ResponseWriter, r *http.Request) {
 
 		if cmd.Type == "command" {
 			s.engine.ProcessCommand(cmd.Payload)
-			s.broadcastState()
+			s.BroadcastState()
 		}
 	}
 }
 
-func (s *Server) broadcastState() {
+func (s *Server) BroadcastState() {
 	state := s.engine.GetState()
 	payload, _ := json.Marshal(state)
 
