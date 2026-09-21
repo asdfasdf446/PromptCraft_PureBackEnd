@@ -34,9 +34,10 @@ type World struct {
 }
 
 type WorldEvent struct {
-	Type    string
-	ActorID string
-	Data    any
+	VirtualMS int64
+	Type      string
+	ActorID   string
+	Data      any
 }
 
 func NewWorld(config Config) (*World, error) {
@@ -160,9 +161,12 @@ func (w *World) Advance(toMS int64) []WorldEvent {
 		}
 		if next == w.nextFoodMS {
 			if pos, ok := w.spawnFood(); ok {
-				events = append(events, WorldEvent{Type: "food_spawned", Data: map[string]any{"position": pos}})
+				events = append(events, WorldEvent{VirtualMS: w.virtualMS, Type: "food_spawned", Data: map[string]any{"position": pos}})
 			}
 			w.nextFoodMS += w.config.FoodSpawnMS
+		}
+		if w.AliveCount() <= 1 {
+			return events
 		}
 	}
 	w.virtualMS = toMS
@@ -337,6 +341,8 @@ func (w *World) AliveCount() int {
 	return count
 }
 
+func (w *World) VirtualMS() int64 { return w.virtualMS }
+
 func (w *World) Player(id string) *Player { return w.players[id] }
 
 func (w *World) Players() []Player {
@@ -345,6 +351,34 @@ func (w *World) Players() []Player {
 		result = append(result, *w.players[id])
 	}
 	return result
+}
+
+func (w *World) Snapshot() Snapshot {
+	rows := make([]string, w.config.Height)
+	for y := 0; y < w.config.Height; y++ {
+		var row strings.Builder
+		for x := 0; x < w.config.Width; x++ {
+			switch {
+			case w.cells[y][x].food:
+				row.WriteByte('F')
+			case w.cells[y][x].terrain == obstacle:
+				row.WriteByte('#')
+			case w.cells[y][x].terrain == soil:
+				row.WriteByte(':')
+			default:
+				row.WriteByte('.')
+			}
+		}
+		rows[y] = row.String()
+	}
+	return Snapshot{
+		VirtualMS: w.virtualMS,
+		MapRows:   rows,
+		Players:   w.Players(),
+		MaxHP:     w.config.StartingHP,
+		MaxHunger: w.config.StartingHunger,
+		MaxEnergy: w.config.StartingEnergy,
+	}
 }
 
 func (w *World) Finalize(atMS int64) {
@@ -360,7 +394,7 @@ func (w *World) kill(p *Player, cause string) WorldEvent {
 	p.HP = max(0, p.HP)
 	p.DeathCause = cause
 	p.SurvivalMS = w.virtualMS
-	return WorldEvent{Type: "agent_died", ActorID: p.ID, Data: map[string]any{"cause": cause}}
+	return WorldEvent{VirtualMS: w.virtualMS, Type: "agent_died", ActorID: p.ID, Data: map[string]any{"cause": cause}}
 }
 
 func (w *World) spawnFood() (Point, bool) {

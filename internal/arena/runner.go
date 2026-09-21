@@ -40,15 +40,16 @@ func (q *eventQueue) Pop() any {
 type eventWriter struct {
 	encoder  *json.Encoder
 	sequence int64
+	observer EventObserver
 }
 
-func newEventWriter(w io.Writer) *eventWriter {
+func newEventWriter(w io.Writer, observer EventObserver) *eventWriter {
 	if w == nil {
 		w = io.Discard
 	}
 	encoder := json.NewEncoder(w)
 	encoder.SetEscapeHTML(false)
-	return &eventWriter{encoder: encoder}
+	return &eventWriter{encoder: encoder, observer: observer}
 }
 
 func (w *eventWriter) write(at int64, eventType, actorID string, data any) error {
@@ -61,12 +62,23 @@ func (w *eventWriter) write(at int64, eventType, actorID string, data any) error
 		}
 		raw = encoded
 	}
-	return w.encoder.Encode(LogEvent{
+	event := LogEvent{
 		Sequence: w.sequence, VirtualMS: at, Type: eventType, ActorID: actorID, Data: raw,
-	})
+	}
+	if err := w.encoder.Encode(event); err != nil {
+		return err
+	}
+	if w.observer != nil {
+		w.observer(event)
+	}
+	return nil
 }
 
 func Run(ctx context.Context, config Config, adapters map[string]Adapter, logOutput io.Writer) (Summary, error) {
+	return RunWithObserver(ctx, config, adapters, logOutput, nil)
+}
+
+func RunWithObserver(ctx context.Context, config Config, adapters map[string]Adapter, logOutput io.Writer, observer EventObserver) (Summary, error) {
 	config.ApplyDefaults()
 	if err := config.Validate(); err != nil {
 		return Summary{}, err
@@ -80,8 +92,11 @@ func Run(ctx context.Context, config Config, adapters map[string]Adapter, logOut
 	if err != nil {
 		return Summary{}, err
 	}
-	log := newEventWriter(logOutput)
+	log := newEventWriter(logOutput, observer)
 	if err := log.write(0, "run_started", "", map[string]any{"config": config}); err != nil {
+		return Summary{}, err
+	}
+	if err := log.write(0, "state_snapshot", "", world.Snapshot()); err != nil {
 		return Summary{}, err
 	}
 
@@ -100,30 +115,44 @@ func Run(ctx context.Context, config Config, adapters map[string]Adapter, logOut
 	stopReason := "event_queue_empty"
 	actionsApplied := 0
 	currentMS := int64(0)
+	lastSnapshotMS := int64(0)
 	for queue.Len() > 0 {
 		if err := ctx.Err(); err != nil {
 			stopReason = "context_cancelled"
 			break
 		}
 		event := heap.Pop(queue).(scheduledEvent)
-		if event.at > config.MaxVirtualMS {
+		if config.TerminationMode == TerminationBounded && event.at > config.MaxVirtualMS {
 			for _, worldEvent := range world.Advance(config.MaxVirtualMS) {
-				if err := writeWorldEvent(log, config.MaxVirtualMS, worldEvent); err != nil {
+				if err := writeWorldEvent(log, worldEvent); err != nil {
 					return Summary{}, err
 				}
 			}
-			currentMS = config.MaxVirtualMS
-			stopReason = "max_virtual_time"
+			currentMS = world.VirtualMS()
+			if err := log.write(currentMS, "state_snapshot", "", world.Snapshot()); err != nil {
+				return Summary{}, err
+			}
+			if world.AliveCount() <= 1 {
+				stopReason = terminalStopReason(world)
+			} else {
+				stopReason = "max_virtual_time"
+			}
 			break
 		}
-		currentMS = event.at
-		for _, worldEvent := range world.Advance(currentMS) {
-			if err := writeWorldEvent(log, currentMS, worldEvent); err != nil {
+		for _, worldEvent := range world.Advance(event.at) {
+			if err := writeWorldEvent(log, worldEvent); err != nil {
 				return Summary{}, err
 			}
 		}
+		currentMS = world.VirtualMS()
+		if currentMS != lastSnapshotMS {
+			if err := log.write(currentMS, "state_snapshot", "", world.Snapshot()); err != nil {
+				return Summary{}, err
+			}
+			lastSnapshotMS = currentMS
+		}
 		if world.AliveCount() <= 1 {
-			stopReason = "last_agent_alive"
+			stopReason = terminalStopReason(world)
 			break
 		}
 		player := world.Player(event.agentID)
@@ -163,11 +192,18 @@ func Run(ctx context.Context, config Config, adapters map[string]Adapter, logOut
 				return Summary{}, err
 			}
 			for _, worldEvent := range worldEvents {
-				if err := writeWorldEvent(log, currentMS, worldEvent); err != nil {
+				if err := writeWorldEvent(log, worldEvent); err != nil {
 					return Summary{}, err
 				}
 			}
 			if !solvent {
+				if err := log.write(currentMS, "state_snapshot", "", world.Snapshot()); err != nil {
+					return Summary{}, err
+				}
+				if world.AliveCount() <= 1 {
+					stopReason = terminalStopReason(world)
+					queue.Init()
+				}
 				continue
 			}
 			success, message, actionEvents := world.Apply(event.agentID, event.decision.Action)
@@ -178,16 +214,19 @@ func Run(ctx context.Context, config Config, adapters map[string]Adapter, logOut
 				return Summary{}, err
 			}
 			for _, worldEvent := range actionEvents {
-				if err := writeWorldEvent(log, currentMS, worldEvent); err != nil {
+				if err := writeWorldEvent(log, worldEvent); err != nil {
 					return Summary{}, err
 				}
 			}
+			if err := log.write(currentMS, "state_snapshot", "", world.Snapshot()); err != nil {
+				return Summary{}, err
+			}
 			if world.AliveCount() <= 1 {
-				stopReason = "last_agent_alive"
+				stopReason = terminalStopReason(world)
 				queue.Init()
 				break
 			}
-			if actionsApplied >= config.MaxActions {
+			if config.TerminationMode == TerminationBounded && actionsApplied >= config.MaxActions {
 				stopReason = "max_actions"
 				queue.Init()
 				break
@@ -206,8 +245,8 @@ func Run(ctx context.Context, config Config, adapters map[string]Adapter, logOut
 	return summary, nil
 }
 
-func writeWorldEvent(log *eventWriter, at int64, event WorldEvent) error {
-	return log.write(at, event.Type, event.ActorID, event.Data)
+func writeWorldEvent(log *eventWriter, event WorldEvent) error {
+	return log.write(event.VirtualMS, event.Type, event.ActorID, event.Data)
 }
 
 func buildSummary(config Config, world *World, stopReason string, virtualMS int64, actionsApplied int) Summary {
@@ -227,13 +266,20 @@ func buildSummary(config Config, world *World, stopReason string, virtualMS int6
 		})
 	}
 	winner := ""
-	if len(standings) > 0 {
+	if stopReason == "last_agent_alive" && len(standings) > 0 && standings[0].Alive {
 		winner = standings[0].AgentID
 	}
 	return Summary{
 		RunName: config.RunName, Seed: config.Seed, Winner: winner, StopReason: stopReason,
 		VirtualMS: virtualMS, ActionsApplied: actionsApplied, Standings: standings,
 	}
+}
+
+func terminalStopReason(world *World) string {
+	if world.AliveCount() == 0 {
+		return "all_agents_dead"
+	}
+	return "last_agent_alive"
 }
 
 // Init clears a queue while preserving its allocated storage.

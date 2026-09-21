@@ -1,11 +1,9 @@
 {
-  "run_name": "deepseek-v4.1-flash-smoke",
-  "termination_mode": "bounded",
+  "run_name": "deepseek-v4.1-flash-deathmatch",
+  "termination_mode": "last_survivor",
   "seed": 20260921,
   "width": 10,
   "height": 10,
-  "max_virtual_ms": 60000,
-  "max_actions": 12,
   "action_cooldown_ms": 500,
   "hunger_tick_ms": 5000,
   "food_spawn_ms": 3000,
@@ -34,3 +32,4 @@
     }
   ]
 }
+

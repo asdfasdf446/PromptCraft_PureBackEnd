@@ -10,24 +10,32 @@ import (
 
 const nanoUSDPerUSD int64 = 1_000_000_000
 
+type TerminationMode string
+
+const (
+	TerminationBounded      TerminationMode = "bounded"
+	TerminationLastSurvivor TerminationMode = "last_survivor"
+)
+
 // Config is deliberately self-contained so a run can archive the exact rules
 // and pricing assumptions used to produce its result.
 type Config struct {
-	RunName           string        `json:"run_name"`
-	Seed              int64         `json:"seed"`
-	Width             int           `json:"width"`
-	Height            int           `json:"height"`
-	MaxVirtualMS      int64         `json:"max_virtual_ms"`
-	MaxActions        int           `json:"max_actions"`
-	ActionCooldownMS  int64         `json:"action_cooldown_ms"`
-	HungerTickMS      int64         `json:"hunger_tick_ms"`
-	FoodSpawnMS       int64         `json:"food_spawn_ms"`
-	StartingHP        int           `json:"starting_hp"`
-	StartingHunger    int           `json:"starting_hunger"`
-	StartingEnergy    int           `json:"starting_energy"`
-	StartingBudgetUSD float64       `json:"starting_budget_usd"`
-	Pricing           Pricing       `json:"pricing"`
-	Agents            []AgentConfig `json:"agents"`
+	RunName           string          `json:"run_name"`
+	TerminationMode   TerminationMode `json:"termination_mode"`
+	Seed              int64           `json:"seed"`
+	Width             int             `json:"width"`
+	Height            int             `json:"height"`
+	MaxVirtualMS      int64           `json:"max_virtual_ms"`
+	MaxActions        int             `json:"max_actions"`
+	ActionCooldownMS  int64           `json:"action_cooldown_ms"`
+	HungerTickMS      int64           `json:"hunger_tick_ms"`
+	FoodSpawnMS       int64           `json:"food_spawn_ms"`
+	StartingHP        int             `json:"starting_hp"`
+	StartingHunger    int             `json:"starting_hunger"`
+	StartingEnergy    int             `json:"starting_energy"`
+	StartingBudgetUSD float64         `json:"starting_budget_usd"`
+	Pricing           Pricing         `json:"pricing"`
+	Agents            []AgentConfig   `json:"agents"`
 }
 
 type Pricing struct {
@@ -59,11 +67,16 @@ func (c *Config) ApplyDefaults() {
 	if c.Height == 0 {
 		c.Height = 10
 	}
-	if c.MaxVirtualMS == 0 {
-		c.MaxVirtualMS = 120_000
+	if c.TerminationMode == "" {
+		c.TerminationMode = TerminationBounded
 	}
-	if c.MaxActions == 0 {
-		c.MaxActions = 200
+	if c.TerminationMode == TerminationBounded {
+		if c.MaxVirtualMS == 0 {
+			c.MaxVirtualMS = 120_000
+		}
+		if c.MaxActions == 0 {
+			c.MaxActions = 200
+		}
 	}
 	if c.ActionCooldownMS == 0 {
 		c.ActionCooldownMS = 500
@@ -103,8 +116,18 @@ func (c Config) Validate() error {
 	if c.Width < 5 || c.Height < 5 {
 		return fmt.Errorf("map must be at least 5x5")
 	}
-	if c.MaxVirtualMS <= 0 || c.MaxActions <= 0 || c.ActionCooldownMS <= 0 || c.HungerTickMS <= 0 || c.FoodSpawnMS <= 0 {
-		return fmt.Errorf("time limits and intervals must be positive")
+	switch c.TerminationMode {
+	case TerminationBounded:
+		if c.MaxVirtualMS <= 0 || c.MaxActions <= 0 {
+			return fmt.Errorf("bounded matches need positive max_virtual_ms and max_actions")
+		}
+	case TerminationLastSurvivor:
+		// Safety limits are deliberately ignored. The caller can still cancel the context.
+	default:
+		return fmt.Errorf("unsupported termination_mode %q", c.TerminationMode)
+	}
+	if c.ActionCooldownMS <= 0 || c.HungerTickMS <= 0 || c.FoodSpawnMS <= 0 {
+		return fmt.Errorf("game intervals must be positive")
 	}
 	if c.StartingHP <= 0 || c.StartingHunger <= 0 || c.StartingEnergy <= 0 || c.StartingBudgetUSD <= 0 {
 		return fmt.Errorf("starting resources must be positive")
@@ -206,6 +229,19 @@ type LogEvent struct {
 	Type      string          `json:"type"`
 	ActorID   string          `json:"actor_id,omitempty"`
 	Data      json.RawMessage `json:"data,omitempty"`
+}
+
+// EventObserver receives each event after it has been persisted to JSONL.
+// Observers must return quickly; the TUI forwards events into a buffered channel.
+type EventObserver func(LogEvent)
+
+type Snapshot struct {
+	VirtualMS int64    `json:"virtual_ms"`
+	MapRows   []string `json:"map_rows"`
+	Players   []Player `json:"players"`
+	MaxHP     int      `json:"max_hp"`
+	MaxHunger int      `json:"max_hunger"`
+	MaxEnergy int      `json:"max_energy"`
 }
 
 type Standing struct {

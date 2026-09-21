@@ -15,11 +15,20 @@ import (
 	"unicode"
 
 	"promptcraft/internal/arena"
+	"promptcraft/internal/tui"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
+
+type runOutcome struct {
+	summary arena.Summary
+	err     error
+}
 
 func main() {
 	configPath := flag.String("config", "configs/local-smoke.json", "path to an arena JSON configuration")
 	outputPath := flag.String("output", "", "run output directory (default: runs/<timestamp>-<run-name>)")
+	headless := flag.Bool("headless", false, "disable the live spectator TUI")
 	flag.Parse()
 
 	configData, err := os.ReadFile(*configPath)
@@ -58,16 +67,45 @@ func main() {
 		log.Fatalf("create event log: %v", err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	summary, runErr := arena.Run(ctx, config, adapters, eventFile)
-	closeErr := eventFile.Close()
-	if runErr != nil {
-		log.Fatalf("run arena: %v", runErr)
+	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	ctx, cancel := context.WithCancel(signalContext)
+	defer cancel()
+
+	var outcome runOutcome
+	if *headless {
+		outcome.summary, outcome.err = arena.Run(ctx, config, adapters, eventFile)
+		if closeErr := eventFile.Close(); outcome.err == nil {
+			outcome.err = closeErr
+		}
+	} else {
+		events := make(chan arena.LogEvent, 512)
+		done := make(chan struct{})
+		go func() {
+			outcome.summary, outcome.err = arena.RunWithObserver(ctx, config, adapters, eventFile, func(event arena.LogEvent) {
+				select {
+				case events <- event:
+				case <-ctx.Done():
+				}
+			})
+			if closeErr := eventFile.Close(); outcome.err == nil {
+				outcome.err = closeErr
+			}
+			close(events)
+			close(done)
+		}()
+		program := tea.NewProgram(tui.NewModel(config, events, cancel), tea.WithAltScreen())
+		_, tuiErr := program.Run()
+		cancel()
+		<-done
+		if tuiErr != nil {
+			log.Fatalf("run spectator TUI: %v", tuiErr)
+		}
 	}
-	if closeErr != nil {
-		log.Fatalf("close event log: %v", closeErr)
+	if outcome.err != nil {
+		log.Fatalf("run arena: %v", outcome.err)
 	}
+	summary := outcome.summary
 	summaryJSON, err := arena.StableSummaryJSON(summary)
 	if err != nil {
 		log.Fatalf("encode summary: %v", err)
@@ -76,7 +114,11 @@ func main() {
 		log.Fatalf("write summary: %v", err)
 	}
 
-	fmt.Printf("Run: %s  Winner: %s  Stop: %s  Virtual time: %d ms\n", summary.RunName, summary.Winner, summary.StopReason, summary.VirtualMS)
+	winner := summary.Winner
+	if winner == "" {
+		winner = "none"
+	}
+	fmt.Printf("Run: %s  Winner: %s  Stop: %s  Virtual time: %d ms\n", summary.RunName, winner, summary.StopReason, summary.VirtualMS)
 	fmt.Println("RANK  AGENT                 ALIVE  SURVIVAL  BUDGET($)  SPENT($)   MEAN LATENCY")
 	for _, standing := range summary.Standings {
 		fmt.Printf("%-5d %-21s %-6t %-9d %-10.6f %-10.6f %.1f ms\n",

@@ -69,6 +69,46 @@ func TestRunIsDeterministicWithFixedAdapters(t *testing.T) {
 	}
 }
 
+func TestObserverReceivesPersistedSnapshots(t *testing.T) {
+	config := testConfig()
+	config.MaxActions = 2
+	adapters, err := BuildAdapters(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventLog bytes.Buffer
+	var observed []LogEvent
+	_, err = RunWithObserver(context.Background(), config, adapters, &eventLog, func(event LogEvent) {
+		observed = append(observed, event)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observed) == 0 {
+		t.Fatal("observer received no events")
+	}
+	foundSnapshot := false
+	for _, event := range observed {
+		if event.Type == "state_snapshot" {
+			foundSnapshot = true
+			var snapshot Snapshot
+			if err := json.Unmarshal(event.Data, &snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if len(snapshot.MapRows) != config.Height || len(snapshot.Players) != len(config.Agents) {
+				t.Fatalf("invalid snapshot: %#v", snapshot)
+			}
+			break
+		}
+	}
+	if !foundSnapshot {
+		t.Fatal("observer did not receive a state_snapshot")
+	}
+	if lines := strings.Count(strings.TrimSpace(eventLog.String()), "\n") + 1; lines != len(observed) {
+		t.Fatalf("persisted %d events, observed %d", lines, len(observed))
+	}
+}
+
 func TestBudgetExhaustionKillsBeforeAction(t *testing.T) {
 	config := testConfig()
 	config.StartingBudgetUSD = 0.001
@@ -96,6 +136,49 @@ func TestBudgetExhaustionKillsBeforeAction(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), `"type":"agent_died"`) {
 		t.Fatal("event log does not contain death event")
+	}
+}
+
+func TestLastSurvivorModeIgnoresBoundedSafetyLimits(t *testing.T) {
+	config := testConfig()
+	config.TerminationMode = TerminationLastSurvivor
+	config.MaxVirtualMS = 1
+	config.MaxActions = 1
+	adapters := map[string]Adapter{
+		"a": fixedAdapter{action: "wait", receipt: Receipt{LatencyMS: 30}},
+		"b": fixedAdapter{action: "wait", receipt: Receipt{LatencyMS: 90}},
+	}
+	summary, err := Run(context.Background(), config, adapters, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.StopReason != "all_agents_dead" {
+		t.Fatalf("expected all agents to starve, got %q", summary.StopReason)
+	}
+	if summary.VirtualMS <= config.MaxVirtualMS || summary.ActionsApplied <= config.MaxActions {
+		t.Fatalf("deathmatch incorrectly honored bounded limits: %#v", summary)
+	}
+	if summary.Winner != "" {
+		t.Fatalf("simultaneous death should have no winner, got %q", summary.Winner)
+	}
+	if summary.VirtualMS != summary.Standings[0].SurvivalMS || summary.VirtualMS != summary.Standings[1].SurvivalMS {
+		t.Fatalf("run did not stop on the exact terminal tick: %#v", summary)
+	}
+}
+
+func TestBoundedLimitProducesNoWinner(t *testing.T) {
+	config := testConfig()
+	config.MaxActions = 1
+	adapters := map[string]Adapter{
+		"a": fixedAdapter{action: "wait", receipt: Receipt{LatencyMS: 30}},
+		"b": fixedAdapter{action: "wait", receipt: Receipt{LatencyMS: 90}},
+	}
+	summary, err := Run(context.Background(), config, adapters, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.StopReason != "max_actions" || summary.Winner != "" {
+		t.Fatalf("bounded cutoff must be a no-contest: %#v", summary)
 	}
 }
 
