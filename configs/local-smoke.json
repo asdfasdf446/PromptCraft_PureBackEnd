@@ -1,0 +1,32 @@
+{
+  "run_name": "local-smoke",
+  "seed": 20260921,
+  "width": 10,
+  "height": 10,
+  "max_virtual_ms": 60000,
+  "max_actions": 100,
+  "action_cooldown_ms": 500,
+  "hunger_tick_ms": 5000,
+  "food_spawn_ms": 3000,
+  "starting_hp": 10,
+  "starting_hunger": 10,
+  "starting_energy": 10,
+  "starting_budget_usd": 1.0,
+  "pricing": {
+    "input_usd_per_million": 1.0,
+    "output_usd_per_million": 4.0
+  },
+  "agents": [
+    {
+      "id": "greedy-fast",
+      "kind": "greedy",
+      "decision_latency_ms": 80
+    },
+    {
+      "id": "random-slow",
+      "kind": "random",
+      "decision_latency_ms": 700
+    }
+  ]
+}
+

@@ -1,0 +1,35 @@
+{
+  "run_name": "deepseek-v4.1-flash-smoke",
+  "seed": 20260921,
+  "width": 10,
+  "height": 10,
+  "max_virtual_ms": 60000,
+  "max_actions": 12,
+  "action_cooldown_ms": 500,
+  "hunger_tick_ms": 5000,
+  "food_spawn_ms": 3000,
+  "starting_hp": 10,
+  "starting_hunger": 10,
+  "starting_energy": 10,
+  "starting_budget_usd": 1.0,
+  "pricing": {
+    "input_usd_per_million": 1.0,
+    "output_usd_per_million": 4.0
+  },
+  "agents": [
+    {
+      "id": "deepseek-v4.1-flash",
+      "kind": "openai",
+      "model": "deepseek-v4.1-flash",
+      "base_url": "https://aigw.net-swift.com",
+      "api_key_env": "SURVIVALBENCH_API_KEY",
+      "timeout_ms": 60000,
+      "max_output_tokens": 4096
+    },
+    {
+      "id": "wait-reference",
+      "kind": "wait",
+      "decision_latency_ms": 5000
+    }
+  ]
+}

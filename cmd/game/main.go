@@ -1,70 +1,106 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
-	"net"
-	"net/http"
 	"os"
-	"promptcraft/internal/engine"
-	"promptcraft/internal/network"
-	"promptcraft/internal/tui"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+	"unicode"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"promptcraft/internal/arena"
 )
 
 func main() {
-	port := flag.Int("port", 8080, "API/WebSocket server port")
+	configPath := flag.String("config", "configs/local-smoke.json", "path to an arena JSON configuration")
+	outputPath := flag.String("output", "", "run output directory (default: runs/<timestamp>-<run-name>)")
 	flag.Parse()
 
-	gameEngine := engine.NewGameEngine()
-
-	// Spawn a second player for API bots
-	gameEngine.AddPlayer("机器人")
-
-	ln, err := listenPort(*port)
+	configData, err := os.ReadFile(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
+		log.Fatalf("read config: %v", err)
 	}
-	addr := ln.Addr().String()
-
-	server := network.NewServer(gameEngine)
-	http.HandleFunc("/ws", server.HandleConnections)
-
-	// REST API endpoints
-	http.HandleFunc("/api/command", server.HandleCommandAPI)
-	http.HandleFunc("/api/map", server.HandleMapAPI)
-	http.HandleFunc("/api/status", server.HandleStatusAPI)
-	http.HandleFunc("/api/join", server.HandleJoinAPI)
-
-	go gameEngine.StartTime(func() {
-		server.BroadcastState()
-	})
-	defer gameEngine.StopTime()
-
-	go func() {
-		if err := http.Serve(ln, nil); err != nil {
-		}
-	}()
-
-	// Print port prominently so it survives the TUI taking over stdout
-	fmt.Fprintf(os.Stderr, "\n=== API server: %s ===\n\n", addr)
-
-	p := tea.NewProgram(tui.NewModel(addr), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		log.Fatalf("TUI Error: %v", err)
+	var config arena.Config
+	if err := json.Unmarshal(configData, &config); err != nil {
+		log.Fatalf("decode config: %v", err)
 	}
+	config.ApplyDefaults()
+	if err := config.Validate(); err != nil {
+		log.Fatalf("invalid config: %v", err)
+	}
+
+	adapters, err := arena.BuildAdapters(config)
+	if err != nil {
+		log.Fatalf("build model adapters: %v", err)
+	}
+	runDir := *outputPath
+	if runDir == "" {
+		runDir = filepath.Join("runs", time.Now().Format("20060102-150405")+"-"+safeName(config.RunName))
+	}
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		log.Fatalf("create run directory: %v", err)
+	}
+	normalizedConfig, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		log.Fatalf("encode normalized config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "config.json"), append(normalizedConfig, '\n'), 0o644); err != nil {
+		log.Fatalf("write normalized config: %v", err)
+	}
+	eventFile, err := os.Create(filepath.Join(runDir, "events.jsonl"))
+	if err != nil {
+		log.Fatalf("create event log: %v", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	summary, runErr := arena.Run(ctx, config, adapters, eventFile)
+	closeErr := eventFile.Close()
+	if runErr != nil {
+		log.Fatalf("run arena: %v", runErr)
+	}
+	if closeErr != nil {
+		log.Fatalf("close event log: %v", closeErr)
+	}
+	summaryJSON, err := arena.StableSummaryJSON(summary)
+	if err != nil {
+		log.Fatalf("encode summary: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "summary.json"), append(summaryJSON, '\n'), 0o644); err != nil {
+		log.Fatalf("write summary: %v", err)
+	}
+
+	fmt.Printf("Run: %s  Winner: %s  Stop: %s  Virtual time: %d ms\n", summary.RunName, summary.Winner, summary.StopReason, summary.VirtualMS)
+	fmt.Println("RANK  AGENT                 ALIVE  SURVIVAL  BUDGET($)  SPENT($)   MEAN LATENCY")
+	for _, standing := range summary.Standings {
+		fmt.Printf("%-5d %-21s %-6t %-9d %-10.6f %-10.6f %.1f ms\n",
+			standing.Rank, standing.AgentID, standing.Alive, standing.SurvivalMS,
+			standing.BudgetUSD, standing.SpentUSD, standing.MeanLatencyMS)
+	}
+	fmt.Printf("Artifacts: %s\n", runDir)
 }
 
-func listenPort(preferred int) (net.Listener, error) {
-	// Try the preferred port first, then try a few more
-	for offset := 0; offset < 10; offset++ {
-		addr := fmt.Sprintf("localhost:%d", preferred+offset)
-		ln, err := net.Listen("tcp", addr)
-		if err == nil {
-			return ln, nil
+func safeName(value string) string {
+	value = strings.ToLower(value)
+	var result strings.Builder
+	for _, r := range value {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r):
+			result.WriteRune(r)
+		case r == '-', r == '_':
+			result.WriteRune(r)
+		case unicode.IsSpace(r):
+			result.WriteByte('-')
 		}
 	}
-	return nil, fmt.Errorf("no available port in range %d-%d", preferred, preferred+9)
+	if result.Len() == 0 {
+		return "arena"
+	}
+	return result.String()
 }
